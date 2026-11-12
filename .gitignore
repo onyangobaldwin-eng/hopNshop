@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.supabase/
+android/.gradle/
+android/local.properties
+android/app/google-services.json
+android/app/*.jks
+android/app/*.keystore
+android/keystore.properties
+releases/*.apk
+releases/*.aab

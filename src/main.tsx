@@ -1,0 +1,13 @@
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { setupIonicReact } from '@ionic/react';
+import App from './App';
+import './styles.css';
+import '@ionic/react/css/core.css';
+import '@ionic/react/css/normalize.css';
+import '@ionic/react/css/structure.css';
+import '@ionic/react/css/typography.css';
+
+setupIonicReact({ mode: 'md' });
+createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
+window.requestAnimationFrame(() => document.getElementById('boot-splash')?.remove());

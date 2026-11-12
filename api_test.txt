@@ -1,0 +1,2 @@
+﻿ERROR: The remote name could not be resolved: 'qzqakatlcqyvlvcfbq.supabase.co'
+STATUS: 

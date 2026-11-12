@@ -1,0 +1,9 @@
+# Architecture
+
+The app is a Vite-built Ionic React client shared by web and Capacitor Android. `src/lib/domain.ts` contains pure business rules that can be reused by UI and server-side tests. Supabase PostgreSQL is the system of record; RLS policies enforce customer isolation and administrator access. The storefront reads only published products. Sourcing requests are written only for an authenticated customer; the client sends a Supabase email sign-in link when no session exists.
+
+Business models remain explicit in `products.business_model`, `orders.business_model`, and the UI/integration boundaries: affiliate clicks leave hopNshop and must use the approved tracking URL; resale and sourcing orders remain hopNshop workflows. Resale checkout snapshots server-validated product/variant prices into an order. Sourcing requests can proceed through a staff quotation and customer acceptance. Payment submission/review and refund processing are manual; no automated payment success is represented.
+
+Timestamped migrations cover profiles, roles, catalogue, sources, suppliers, affiliate links/clicks, sourcing, quotations, orders, payments, refunds, fulfilment events, wishlists, notifications, support, editorial content, expenses, exchange rates, integrations and audit logs. Later migrations harden RLS, add customer order/quotation RPCs, manual payment submission/review, staff-controlled order transitions, an admin operational overview, and manual refund request/review/completion RPCs. Refund completion requires a real external transaction reference; a full refund marks an order refunded only after recorded completions cover its total. Apply migrations in filename order. Add future schema through timestamped migrations.
+
+Production catalogue content is managed through Supabase; no catalogue is hardcoded in the client. Add repositories around Supabase queries as pages are expanded. Keep service-role operations inside Edge Functions only.

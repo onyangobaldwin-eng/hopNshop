@@ -1,0 +1,37 @@
+# Administrator guide
+
+Assign roles directly in a controlled Supabase administrative workflow; users cannot self-register as admins. Review and verify source data before publishing products. Set `publication_status=published` only when source URL, price freshness, availability, fulfilment model and disclosures are recorded.
+
+Admin and editor roles can create/edit products in the account catalogue panel. Publishing requires the editor to confirm the source, price, availability, disclosure and supplier/program permissions. Add descriptive-alt-text images through the product image manager; the private bucket exposes short-lived URLs only for published products. Keep draft images inside staff review.
+
+For sourcing, use the existing request queue for link/image review and quotation preparation, and the admin/editor-only sourcing workbench for structured product details, discovery tasks, candidate review, supplier evidence and costing. Automatic catalogue lookup remains unavailable until a permitted provider API and exact HTTPS host allowlist are configured. Candidate match scores and risk flags are advisory; approve only after an authorized human checks the actual supplier evidence. A high-risk candidate requires a detailed review note to approve.
+
+The workbench can add manually researched candidate listings without fetching arbitrary URLs. A candidate is not a quotation and does not establish product availability or authenticity. Cost calculations distinguish estimates from confirmed amounts; confirmed inputs require an invoice/quote evidence reference, and any target selling-price override requires a reason. Create a customer quotation through the existing sourcing quote form, including its expiry and delivery window. Only procure after the customer accepts the quotation and payment is verified. Record each fulfilment update only when it has actually occurred.
+
+Discovery tasks are queued on request submission and can be re-run by admin/editor staff. The manual “process queue now” action is bounded; scheduled processing requires the separate worker secret and a verified Supabase Cron/`pg_net` invocation. If providers are missing, the task moves to manual review; never treat an unavailable provider as a successful search. See `docs/INTEGRATIONS.md` for deployment, provider secrets and schedule setup.
+
+Affiliate products redirect to the retailer and must not create hopNshop payment orders. Finance reports show order value, verified payments and operating expenses by currency. Refund and commission reconciliation is not yet included.
+
+Use the affiliate programme panel to record approval status, terms URL, commission rate and disclosure wording. Create campaign links only for an approved programme and affiliate product. A link is visible to shoppers only while both the programme is approved and the product is published. Clicks are recorded when a shopper follows the link; verify partner-side conversion and commission statements separately.
+
+Admin users can manage supplier contacts, samples, return/payment terms, shipping permissions and verification evidence. A repository status of “verified” records staff review; it does not replace supplier permission for resale, blind shipping or use of product assets.
+
+Customers can submit support cases and read in-app updates in their account. Admin/fulfilment staff can respond and change case status. New quotations, customer-visible fulfilment updates and staff responses create in-app notifications. External email, SMS and WhatsApp delivery still requires a configured provider.
+
+Finance/admin users can filter order/payment/expense records by date, review confirmed order value and verified payments by currency, record operating expenses and export the visible report rows to CSV. The report does not calculate net profit or affiliate commissions because verified cost and partner-conversion data are not available in the database.
+
+For manual M-Pesa submissions, verify the transaction reference, payer, amount and recipient against the official statement before using the finance queue to confirm it. Customer-entered details remain pending and do not prove payment. After verification, fulfilment staff can progress the order one allowed step at a time and record a factual customer-visible update, courier and tracking reference. Do not record dispatch or delivery before it occurs. STK Push and automatic refund settlement are not configured.
+
+## Hybrid delivery operations
+
+The delivery administration panel is available to admin and fulfilment roles. It requires `202611120008_hybrid_delivery_core.sql`; that migration has not yet been applied or tested against the live database. Apply migrations in filename order in a reviewed environment before expecting the panel to load.
+
+Configure a real courier partner and its documented agreement first. Courier API integration is not configured; tracking updates are manual. Add a locality only after confirming the courier serves it. Add a KES rate with the partner/source reference, quote date, explicit expiry, handling/weight limits and verified delivery window. Only activate a courier/locality/service/rate when those facts are confirmed. Rates are unique per active service area and expire; deactivate an old rate before activating its replacement. All counties are seeded inactive and are not represented as nationwide coverage.
+
+Enter reviewed shipping weight and dimensions for each resale product before accepting checkout for it. Checkout exposes only localities with an active courier service and a current rate. It rejects non-KES baskets, missing dimensions, stale rates and unsupported destinations. Pickup-point orders must use the exact configured pickup point. The fee is an estimate based on entered shipment dimensions/rate rules; before payment, an administrator can request a revised fee and the customer must approve it. The system intentionally has no post-payment fee collection workflow.
+
+For each paid resale item, use the fulfilment panel to select the hub or an approved direct-supplier route. A direct route is allowed only for a verified supplier with documented neutral packaging, tracking, delivery evidence, returns, damage/loss and timing terms. Hub dispatch requires supplier-shipment evidence, recorded receipt and a passed inspection for every inbound shipment. Create a courier parcel only against an active service area and current rate, then record factual courier events. The database prevents an order from being marked paid without an exact verified payment, dispatched without evidence/tracking for each fulfilment, or delivered before every parcel has delivery proof.
+
+Customers see parcel events and can submit return/support requests from their account. Staff must review each return and process any actual refund through the existing finance refund workflow; marking a return refunded requires a completed refund record. Parcel event notifications currently use the in-app channel; external email/SMS/push delivery is not wired for this workflow. The current admin inspection form records findings without photo uploads, and its proof form supports recipient confirmation only.
+
+This delivery milestone applies to resale checkout. Affiliate orders remain with the retailer. Existing personal-sourcing quotations still lack delivery-locality capture and parcel routing; do not describe sourcing orders as using the new delivery workflow.

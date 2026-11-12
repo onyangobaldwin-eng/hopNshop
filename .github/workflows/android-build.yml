@@ -1,0 +1,117 @@
+name: Android packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Build hopNshop Android packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run application tests
+        run: npm test -- --configLoader runner
+
+      - name: Check Supabase client configuration
+        id: backend
+        env:
+          SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "Configure VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY repository secrets before building the app." >&2
+            exit 1
+          fi
+
+      - name: Build web assets for Android
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_APP_URL: ${{ secrets.VITE_APP_URL }}
+        run: npm run build:android
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+
+      - name: Check Firebase configuration
+        id: firebase
+        env:
+          FIREBASE_CONFIG: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$FIREBASE_CONFIG" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Firebase configuration
+        if: steps.firebase.outputs.configured == 'true'
+        env:
+          FIREBASE_CONFIG: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
+        run: printf '%s' "$FIREBASE_CONFIG" | base64 --decode > android/app/google-services.json
+
+      - name: Build debug APK
+        run: |
+          chmod +x android/gradlew
+          ./android/gradlew --no-daemon -p android assembleDebug
+          mkdir -p releases
+          cp android/app/build/outputs/apk/debug/app-debug.apk releases/hopNshop-1.0.0-debug.apk
+
+      - name: Check release signing configuration
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build signed release APK and AAB
+        if: steps.signing.outputs.configured == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/hopnshop-release.jks
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          ./android/gradlew --no-daemon -p android assembleRelease bundleRelease
+          cp android/app/build/outputs/apk/release/app-release.apk releases/hopNshop-1.0.0-release.apk
+          cp android/app/build/outputs/bundle/release/app-release.aab releases/hopNshop-1.0.0-release.aab
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: hopnshop-android-1.0.0
+          path: releases/*
+          if-no-files-found: error
+          retention-days: 30
