@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -6,43 +6,8 @@
     <meta name="theme-color" content="#102a43" />
     <meta name="description" content="hopNshop — curated commerce and trusted product sourcing for Kenya." />
     <link rel="canonical" href="https://hopnshop.co.ke/" />
-    <meta property="og:type" content="website" />
-    <meta property="og:title" content="hopNshop - curated, sourced, yours" />
-    <meta property="og:description" content="Curated finds and trusted product sourcing for Kenya." />
-    <meta property="og:url" content="https://hopnshop.co.ke/" />
-    <meta name="twitter:card" content="summary" />
     <title>hopNshop — curated, sourced, yours</title>
   </head>
-  <body>
-    <div id="boot-splash" role="status" aria-label="Loading hopNshop">
-      <img src="/images/hopnshop-logo.png" alt="hopNshop — Shop Smart. Live Better." />
-    </div>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-    <style>
-      #boot-splash {
-        position: fixed;
-        z-index: 9999;
-        inset: 0;
-        display: grid;
-        place-items: center;
-        background: #050505;
-      }
-      #boot-splash img {
-        display: block;
-        width: min(78vw, 460px);
-        max-height: 68vh;
-        object-fit: contain;
-      }
-      @media (prefers-reduced-motion: no-preference) {
-        #boot-splash img {
-          animation: hopnshop-boot-in 280ms ease-out both;
-        }
-        @keyframes hopnshop-boot-in {
-          from { opacity: 0; transform: scale(.98); }
-          to { opacity: 1; transform: scale(1); }
-        }
-      }
-    </style>
-  </body>
+  <body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
 </html>
+
