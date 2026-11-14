@@ -1,0 +1,1323 @@
+﻿import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { IonApp, IonContent, IonIcon, IonPage } from '@ionic/react';
+import { Capacitor } from '@capacitor/core';
+import { Browser } from '@capacitor/browser';
+import { Camera, CameraResultType, CameraSource } from '@capacitor/camera';
+import { Share } from '@capacitor/share';
+import { bagHandleOutline, cubeOutline, heart, heartOutline, searchOutline, sparklesOutline, arrowForwardOutline } from 'ionicons/icons';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
+import { canPurchaseResaleProduct, filterProducts, isValidPublicProductUrl, resaleOrderSchema, sourcingReferenceImageSchema, sourcingRequestSchema, type BusinessModel, type Product, type ProductAvailability, type ProductVariant } from './lib/domain';
+import { getAuthRedirectUrl, initializeNativeApp } from './lib/nativeApp';
+import { notificationEvents } from './lib/notificationEvents';
+import CustomerAccount from './components/CustomerAccount';
+import CustomerNotificationCentre from './components/CustomerNotificationCentre';
+import CheckoutSavedAddresses from './components/CheckoutSavedAddresses';
+import StorefrontHeader from './components/StorefrontHeader';
+import HomeHero from './components/HomeHero';
+import { STOREFRONT_CATEGORIES } from './lib/storefrontCategories';
+
+const modelLabels: Record<BusinessModel, string> = {
+  affiliate: 'Affiliate find',
+  resale: 'hopNshop sale',
+  sourcing: 'Personal sourcing'
+};
+
+interface ProductRecord {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  brand: string | null;
+  availability: ProductAvailability;
+  business_model: BusinessModel;
+  category: { name: string } | { name: string }[] | null;
+  currency: string;
+  local_selling_price: number | string | null;
+  estimated_shipping: number | string | null;
+  estimated_duties: number | string | null;
+  source_url: string | null;
+  affiliate_tracking_url: string | null;
+  verified_at: string | null;
+  created_at: string;
+  product_media: { storage_path: string; sort_order: number }[];
+  product_variants: ProductVariant[];
+}
+
+interface SourcingCategory {
+  id: string;
+  name: string;
+}
+
+interface CollectionRecord { id: string; name: string; description: string | null; image_url: string | null; collection_products: { sort_order: number; product: { id: string } | { id: string }[] | null }[]; }
+interface DiscoveryCollection { id: string; name: string; description?: string; imageUrl?: string; products: Product[]; }
+interface CampaignRecord {
+  id: string;
+  title: string;
+  description: string;
+  image_url: string;
+  cta_label: string;
+  target_type: 'category' | 'collection' | 'product' | 'sourcing';
+  category_id: string | null;
+  collection_id: string | null;
+  product_id: string | null;
+}
+interface ActiveCampaign {
+  id: string;
+  title: string;
+  description: string;
+  imageUrl: string;
+  ctaLabel: string;
+  targetType: CampaignRecord['target_type'];
+  targetId: string | null;
+}
+
+interface CartLine {
+  product: Product;
+  quantity: number;
+  variant?: ProductVariant;
+}
+
+interface DeliveryLocality {
+  id: string;
+  county: string;
+  town: string;
+  locality: string;
+  estate_or_neighbourhood: string | null;
+  pickup_point: string | null;
+}
+
+interface DeliveryOption {
+  service_area_id: string;
+  courier_id: string;
+  courier_name: string;
+  service_type: 'doorstep' | 'pickup_point';
+  currency: string;
+  estimated_fee: number | string;
+  estimated_parcels: number;
+  min_delivery_days: number;
+  max_delivery_days: number;
+  rate_source: string;
+  quoted_at: string;
+}
+
+const CATALOGUE_PAGE_SIZE = 24;
+
+async function mapCatalogueRecords(records: ProductRecord[], client: NonNullable<typeof supabase>): Promise<Product[]> {
+  const mappedProducts = await Promise.all(records.map(async record => {
+    const price = record.local_selling_price === null ? undefined : Number(record.local_selling_price);
+    const imageUrls = (await Promise.all((record.product_media ?? []).sort((left, right) => left.sort_order - right.sort_order).map(async media => {
+      const { data: signed, error: imageError } = await client.storage.from('product-media').createSignedUrl(media.storage_path, 3600);
+      if (imageError) {
+        console.error('A published product image could not be loaded.', imageError.message);
+        return '';
+      }
+      return signed.signedUrl;
+    }))).filter(Boolean);
+    return {
+      id: record.id,
+      name: record.name,
+      slug: record.slug,
+      description: record.description,
+      brand: record.brand ?? undefined,
+      category: Array.isArray(record.category) ? record.category[0]?.name : record.category?.name,
+      availability: record.availability,
+      businessModel: record.business_model,
+      currency: record.currency,
+      localPrice: price !== undefined && Number.isFinite(price) ? price : undefined,
+      imageUrl: imageUrls[0],
+      imageUrls,
+      variants: (record.product_variants ?? []).filter(variant => variant.available),
+      estimatedShipping: record.estimated_shipping === null ? undefined : Number(record.estimated_shipping),
+      estimatedDuties: record.estimated_duties === null ? undefined : Number(record.estimated_duties),
+      sourceUrl: record.source_url ?? undefined,
+      affiliateTrackingUrl: record.affiliate_tracking_url ?? undefined,
+      verifiedAt: record.verified_at ?? undefined,
+      publishedAt: record.verified_at ?? record.created_at
+    };
+  }));
+  const { data: affiliateRows, error: affiliateError } = await client.rpc('list_public_affiliate_links');
+  if (affiliateError) console.error('Approved affiliate links could not be loaded.', affiliateError.message);
+  const linkByProduct = new Map(((affiliateRows ?? []) as { product_id: string; affiliate_link_id: string }[]).map(row => [row.product_id, row.affiliate_link_id]));
+  return mappedProducts.map(product => ({ ...product, affiliateLinkId: linkByProduct.get(product.id), affiliateTrackingUrl: undefined }));
+}
+
+function App() {
+  const [search, setSearch] = useState('');
+  const [detailProduct, setDetailProduct] = useState<Product | null>(null);
+  const [selectedVariantId, setSelectedVariantId] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [brandFilter, setBrandFilter] = useState('');
+  const [sizeFilter, setSizeFilter] = useState('');
+  const [colourFilter, setColourFilter] = useState('');
+  const [availabilityFilter, setAvailabilityFilter] = useState<ProductAvailability | ''>('');
+  const [currencyFilter, setCurrencyFilter] = useState('');
+  const [sortBy, setSortBy] = useState<'newest' | 'price_asc' | 'price_desc' | 'name'>('newest');
+  const [visibleCount, setVisibleCount] = useState(12);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [publishedCategories, setPublishedCategories] = useState<string[]>([]);
+  const [sourcingCategories, setSourcingCategories] = useState<SourcingCategory[]>([]);
+  const [categoryLoadError, setCategoryLoadError] = useState(false);
+  const [collections, setCollections] = useState<DiscoveryCollection[]>([]);
+  const [campaign, setCampaign] = useState<ActiveCampaign | null>(null);
+  const [productsLoading, setProductsLoading] = useState(true);
+  const [loadingMoreProducts, setLoadingMoreProducts] = useState(false);
+  const [hasMoreProducts, setHasMoreProducts] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState('');
+  const [catalogueError, setCatalogueError] = useState(false);
+  const [storefrontMessage, setStorefrontMessage] = useState('');
+  const [sourcingOpen, setSourcingOpen] = useState(false);
+  const [customerEmail, setCustomerEmail] = useState('');
+  const [productUrl, setProductUrl] = useState('');
+  const [productName, setProductName] = useState('');
+  const [sourcingCategoryId, setSourcingCategoryId] = useState('');
+  const [brandPreference, setBrandPreference] = useState('');
+  const [modelSpecification, setModelSpecification] = useState('');
+  const [productCondition, setProductCondition] = useState<'new' | 'used' | 'refurbished' | 'any'>('any');
+  const [preferredLocation, setPreferredLocation] = useState('');
+  const [referenceImage, setReferenceImage] = useState<File | null>(null);
+  const [quantity, setQuantity] = useState('1');
+  const [variant, setVariant] = useState('');
+  const [notes, setNotes] = useState('');
+  const [sourceMessage, setSourceMessage] = useState('');
+  const [sourceSubmitting, setSourceSubmitting] = useState(false);
+  const [sourceSubmitted, setSourceSubmitted] = useState(false);
+  const [userId, setUserId] = useState('');
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [notificationCentreOpen, setNotificationCentreOpen] = useState(false);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authMessage, setAuthMessage] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authMode, setAuthMode] = useState<'sign_in' | 'sign_up' | 'forgot_password' | 'recovery'>('sign_in');
+  const [authPassword, setAuthPassword] = useState('');
+  const authEmailInput = useRef<HTMLInputElement>(null);
+  const [wishlistProductIds, setWishlistProductIds] = useState<string[]>([]);
+  const [wishlistBusyId, setWishlistBusyId] = useState('');
+  const [wishlistMessage, setWishlistMessage] = useState('');
+  const [cart, setCart] = useState<CartLine[]>([]);
+  const [cartOpen, setCartOpen] = useState(false);
+  const [cartMessage, setCartMessage] = useState('');
+  const [affiliateMessage, setAffiliateMessage] = useState('');
+  const [shareMessage, setShareMessage] = useState('');
+  const [isOnline, setIsOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine);
+  const [checkoutSubmitting, setCheckoutSubmitting] = useState(false);
+  const [delivery, setDelivery] = useState({ recipientName: '', phone: '', addressLine: '', city: '', county: '' });
+  const [deliveryLocalityId, setDeliveryLocalityId] = useState('');
+  const [deliveryLocalities, setDeliveryLocalities] = useState<DeliveryLocality[]>([]);
+  const [deliveryLocalitiesLoading, setDeliveryLocalitiesLoading] = useState(false);
+  const [deliveryLocalitiesError, setDeliveryLocalitiesError] = useState('');
+  const [deliveryOptions, setDeliveryOptions] = useState<DeliveryOption[]>([]);
+  const [deliveryOptionsLoading, setDeliveryOptionsLoading] = useState(false);
+  const [deliveryOptionsError, setDeliveryOptionsError] = useState('');
+  const [deliveryServiceAreaId, setDeliveryServiceAreaId] = useState('');
+  const checkoutIdempotencyKey = useRef<{ fingerprint: string; key: string } | null>(null);
+  const nativeBackAction = useRef<() => boolean>(() => false);
+  const filtered = useMemo(() => filterProducts(products, {
+    search,
+    category: categoryFilter,
+    brand: brandFilter,
+    size: sizeFilter,
+    colour: colourFilter,
+    availability: availabilityFilter,
+    currency: currencyFilter,
+    sortBy
+  }), [products, search, categoryFilter, brandFilter, sizeFilter, colourFilter, availabilityFilter, currencyFilter, sortBy]);
+  const categories = useMemo(() => Array.from(new Set([
+    ...STOREFRONT_CATEGORIES.map(category => category.name),
+    ...publishedCategories.map(category => category === 'Sports' ? 'Sports & Outdoors' : category),
+    ...products.map(product => product.category === 'Sports' ? 'Sports & Outdoors' : product.category).filter((value): value is string => Boolean(value))
+  ])).sort(), [publishedCategories, products]);
+  const brands = useMemo(() => Array.from(new Set(products.map(product => product.brand).filter((value): value is string => Boolean(value)))).sort(), [products]);
+  const currencies = useMemo(() => Array.from(new Set(['KES', ...products.map(product => product.currency.toUpperCase())])).sort(), [products]);
+  const sizes = useMemo(() => Array.from(new Set(products.flatMap(product => (product.variants ?? [])
+    .filter(variant => variant.available)
+    .flatMap(variant => Object.entries(variant.attributes)
+      .filter(([key, value]) => key.toLowerCase() === 'size' && ['string', 'number'].includes(typeof value))
+      .map(([, value]) => String(value)))))).sort(), [products]);
+  const colours = useMemo(() => Array.from(new Set(products.flatMap(product => (product.variants ?? [])
+    .filter(variant => variant.available)
+    .flatMap(variant => Object.entries(variant.attributes)
+      .filter(([key, value]) => ['colour', 'color'].includes(key.toLowerCase()) && ['string', 'number'].includes(typeof value))
+      .map(([, value]) => String(value)))))).sort(), [products]);
+  const searchSuggestions = useMemo(() => Array.from(new Set(products.map(product => product.name))).slice(0, 20), [products]);
+  const visibleProducts = filtered.slice(0, visibleCount);
+  const cartItemsForDelivery = useMemo(() => cart.map(line => ({
+    product_id: line.product.id,
+    variant_id: line.variant?.id,
+    quantity: line.quantity
+  })), [cart]);
+  const cartItemsSubtotal = cart.reduce(
+    (sum, line) => sum + (line.variant?.price ?? line.product.localPrice ?? 0) * line.quantity,
+    0
+  );
+  const selectedDeliveryOption = deliveryOptions.find(option => option.service_area_id === deliveryServiceAreaId);
+  const selectedDeliveryLocality = deliveryLocalities.find(locality => locality.id === deliveryLocalityId);
+
+  nativeBackAction.current = () => {
+    if (authOpen) {
+      setAuthOpen(false);
+      return true;
+    }
+    if (sourcingOpen) {
+      setSourcingOpen(false);
+      return true;
+    }
+    if (notificationCentreOpen) {
+      setNotificationCentreOpen(false);
+      return true;
+    }
+    if (accountOpen) {
+      setAccountOpen(false);
+      return true;
+    }
+    if (cartOpen) {
+      setCartOpen(false);
+      return true;
+    }
+    if (detailProduct) {
+      setDetailProduct(null);
+      return true;
+    }
+    return false;
+  };
+
+  useEffect(() => {
+    let active = true;
+    const updateNetwork = (connected: boolean) => {
+      if (active) setIsOnline(connected);
+    };
+    const handleOnline = () => updateNetwork(true);
+    const handleOffline = () => updateNetwork(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    const removeNativeListeners = initializeNativeApp({
+      onBack: () => nativeBackAction.current(),
+      onNetworkChange: updateNetwork
+    });
+    return () => {
+      active = false;
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      removeNativeListeners();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedDeliveryOption || !selectedDeliveryLocality) return;
+    if (selectedDeliveryOption.service_type === 'pickup_point') {
+      const pickupPoint = selectedDeliveryLocality.pickup_point ?? '';
+      setDelivery(current => current.addressLine === pickupPoint ? current : { ...current, addressLine: pickupPoint });
+    } else if (selectedDeliveryLocality.pickup_point
+      && delivery.addressLine === selectedDeliveryLocality.pickup_point) {
+      setDelivery(current => ({ ...current, addressLine: '' }));
+    }
+  }, [delivery.addressLine, selectedDeliveryLocality, selectedDeliveryOption]);
+
+  useEffect(() => {
+    if (!cartOpen) return;
+    if (!supabase) {
+      setDeliveryLocalitiesError('Delivery services are not configured.');
+      return;
+    }
+    let active = true;
+    setDeliveryLocalitiesLoading(true);
+    setDeliveryLocalitiesError('');
+    void supabase.rpc('list_serviceable_delivery_localities').then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        console.error('Serviceable delivery locations could not be loaded.', error.message);
+        setDeliveryLocalities([]);
+        setDeliveryLocalitiesError('Verified delivery areas are unavailable. Please try again later.');
+      } else {
+        setDeliveryLocalities((data ?? []) as DeliveryLocality[]);
+      }
+      setDeliveryLocalitiesLoading(false);
+    });
+    return () => { active = false; };
+  }, [cartOpen]);
+
+  useEffect(() => {
+    if (!cart.length || !deliveryLocalityId || !supabase) {
+      setDeliveryOptions([]);
+      setDeliveryServiceAreaId('');
+      setDeliveryOptionsLoading(false);
+      setDeliveryOptionsError('');
+      return;
+    }
+    let active = true;
+    setDeliveryOptionsLoading(true);
+    setDeliveryOptionsError('');
+    void supabase.rpc('list_delivery_options', {
+      p_items: cartItemsForDelivery,
+      p_locality_id: deliveryLocalityId
+    }).then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        console.error('Delivery options could not be calculated.', error.message);
+        setDeliveryOptions([]);
+        setDeliveryServiceAreaId('');
+        setDeliveryOptionsError('Delivery could not be quoted for this basket. Confirm the product dimensions and configured courier rate, or contact support.');
+      } else {
+        const options = (data ?? []) as DeliveryOption[];
+        setDeliveryOptions(options);
+        setDeliveryServiceAreaId(current => options.some(option => option.service_area_id === current)
+          ? current
+          : options[0]?.service_area_id ?? '');
+        if (options.length === 0) {
+          setDeliveryOptionsError('No configured courier and verified rate can serve this basket at the selected destination.');
+        }
+      }
+      setDeliveryOptionsLoading(false);
+    });
+    return () => { active = false; };
+  }, [cart, cartItemsForDelivery, deliveryLocalityId]);
+
+  useEffect(() => {
+    document.title = search ? `Search Â· ${search} Â· hopNshop` : 'hopNshop â€” curated, sourced, yours';
+  }, [search]);
+
+  useEffect(() => {
+    setVisibleCount(12);
+  }, [search, categoryFilter, brandFilter, sizeFilter, colourFilter, availabilityFilter, currencyFilter, sortBy]);
+
+  useEffect(() => {
+    if (!supabase || !userId) {
+      setWishlistProductIds([]);
+      return;
+    }
+    let active = true;
+    void supabase.from('wishlists').select('wishlist_items(product_id)').eq('user_id', userId).maybeSingle()
+      .then(({ data, error }) => {
+        if (!active) return;
+        if (error) {
+          console.error('Wishlist could not be loaded.', error.message);
+          return;
+        }
+        const wishlist = data as { wishlist_items: { product_id: string }[] } | null;
+        setWishlistProductIds((wishlist?.wishlist_items ?? []).map(item => item.product_id));
+      });
+    return () => { active = false; };
+  }, [userId]);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client) {
+      setProductsLoading(false);
+      return;
+    }
+
+    let active = true;
+    const { data: { subscription } } = client.auth.onAuthStateChange((event, session) => {
+      if (active) {
+        setCustomerEmail(session?.user.email ?? '');
+        setUserId(session?.user.id ?? '');
+        if (event === 'PASSWORD_RECOVERY') {
+          setAuthMode('recovery');
+          setAuthMessage('Choose a new password for your account.');
+          setAuthOpen(true);
+        } else if (session) setAuthOpen(false);
+      }
+    });
+
+    const loadCategories = async () => {
+      try {
+        const { data, error } = await client.from('categories').select('id,name').eq('published', true).order('name');
+        if (!active) return;
+        if (error) {
+          console.error('Published product categories could not be loaded.', error.message);
+          setCategoryLoadError(true);
+          return;
+        }
+        const categoryRows = (data ?? []) as SourcingCategory[];
+        setSourcingCategories(categoryRows);
+        setPublishedCategories(categoryRows.map(category => category.name));
+        setCategoryLoadError(false);
+      } catch (error) {
+        if (!active) return;
+        console.error('Published product categories could not be loaded.', error instanceof Error ? error.message : String(error));
+        setCategoryLoadError(true);
+      }
+    };
+
+    const loadProducts = async () => {
+      const { data, error } = await client
+        .from('products')
+        .select('id,name,slug,description,brand,availability,business_model,category:categories(name),currency,local_selling_price,estimated_shipping,estimated_duties,source_url,affiliate_tracking_url,verified_at,created_at,product_media(storage_path,sort_order),product_variants(id,name,sku,attributes,price,available)')
+        .eq('publication_status', 'published')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(0, CATALOGUE_PAGE_SIZE);
+
+      if (!active) return;
+      if (error) {
+        console.error('Published catalogue could not be loaded.', error.message);
+        setCatalogueError(true);
+        setProductsLoading(false);
+        return;
+      }
+
+      const records = (data ?? []) as ProductRecord[];
+      const productsWithLinks = await mapCatalogueRecords(records.slice(0, CATALOGUE_PAGE_SIZE), client);
+      if (!active) return;
+      setProducts(productsWithLinks);
+      setHasMoreProducts(records.length > CATALOGUE_PAGE_SIZE);
+      const { data: collectionData, error: collectionError } = await client.from('collections')
+        .select('id,name,description,image_url,collection_products(sort_order,product:products(id))')
+        .eq('published', true).order('name');
+      if (!active) return;
+      if (collectionError) console.error('Published collections could not be loaded.', collectionError.message);
+      else {
+        const collectionProductIds = Array.from(new Set(((collectionData ?? []) as CollectionRecord[]).flatMap(collection =>
+          collection.collection_products.flatMap(item => {
+            const id = Array.isArray(item.product) ? item.product[0]?.id : item.product?.id;
+            return id ? [id] : [];
+          })
+        )));
+        const { data: collectionProductsData, error: collectionProductsError } = collectionProductIds.length > 0
+          ? await client.from('products')
+            .select('id,name,slug,description,brand,availability,business_model,category:categories(name),currency,local_selling_price,estimated_shipping,estimated_duties,source_url,affiliate_tracking_url,verified_at,created_at,product_media(storage_path,sort_order),product_variants(id,name,sku,attributes,price,available)')
+            .eq('publication_status', 'published')
+            .in('id', collectionProductIds)
+          : { data: [], error: null };
+        if (collectionProductsError) console.error('Collection products could not be loaded.', collectionProductsError.message);
+        const collectionProducts = collectionProductsError
+          ? []
+          : await mapCatalogueRecords((collectionProductsData ?? []) as ProductRecord[], client);
+        if (!active) return;
+        const byId = new Map([...productsWithLinks, ...collectionProducts].map(product => [product.id, product]));
+        setCollections(((collectionData ?? []) as CollectionRecord[]).map(collection => ({
+          id: collection.id,
+          name: collection.name,
+          description: collection.description ?? undefined,
+          imageUrl: collection.image_url ?? undefined,
+          products: collection.collection_products.sort((a, b) => a.sort_order - b.sort_order)
+            .flatMap(item => {
+              const id = Array.isArray(item.product) ? item.product[0]?.id : item.product?.id;
+              const product = id ? byId.get(id) : undefined;
+              return product ? [product] : [];
+            })
+        })).filter(collection => collection.products.length > 0));
+      }
+      const { data: campaignData, error: campaignError } = await client.from('promotional_campaigns')
+        .select('id,title,description,image_url,cta_label,target_type,category_id,collection_id,product_id')
+        .eq('published', true)
+        .lte('starts_at', new Date().toISOString())
+        .gt('ends_at', new Date().toISOString())
+        .order('starts_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!active) return;
+      if (campaignError) {
+        if (campaignError.message.includes("Could not find the table 'public.promotional_campaigns' in the schema cache")) {
+          console.warn('Campaigns are unavailable until the marketplace campaign migration is applied.');
+        } else {
+          console.error('Active storefront campaign could not be loaded.', campaignError.message);
+        }
+      }
+      const record = campaignData as CampaignRecord | null;
+      setCampaign(record ? {
+        id: record.id,
+        title: record.title,
+        description: record.description,
+        imageUrl: record.image_url,
+        ctaLabel: record.cta_label,
+        targetType: record.target_type,
+        targetId: record.category_id ?? record.collection_id ?? record.product_id
+      } : null);
+      setProductsLoading(false);
+    };
+
+    void loadCategories();
+    void loadProducts();
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const openSourcingDesk = (product?: Product) => {
+    setSourceMessage('');
+    setSourceSubmitted(false);
+    if (product) {
+      setProductName(product.name);
+      setProductUrl(product.sourceUrl ?? '');
+    }
+    setSourcingOpen(true);
+  };
+
+  const formatPrice = (price: number, currency: string) => {
+    const currencyLabel = currency.toUpperCase() === 'KES' ? 'KSh' : currency.toUpperCase();
+    return `${currencyLabel} ${price.toLocaleString()}`;
+  };
+
+  const openWishlist = () => {
+    if (userId) setAccountOpen(true);
+    else setAuthOpen(true);
+  };
+
+  const openAffiliateRetailer = async (product: Product) => {
+    if (!supabase || !product.affiliateLinkId) return;
+    setAffiliateMessage('');
+    const popup = Capacitor.isNativePlatform() ? null : window.open('about:blank', '_blank');
+    const { data, error } = await supabase.rpc('record_affiliate_click', { p_link_id: product.affiliateLinkId });
+    if (error || typeof data !== 'string' || !isValidPublicProductUrl(data)) {
+      popup?.close();
+      console.error('Approved affiliate link could not be opened.', error?.message ?? 'The returned URL was not a public HTTPS URL.');
+      setAffiliateMessage('This retailer link is temporarily unavailable.');
+      return;
+    }
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await Browser.open({ url: data });
+      } catch (openError) {
+        console.error('The approved retailer link could not be opened in the browser.', openError);
+        setAffiliateMessage('This retailer link could not be opened. Please try again.');
+      }
+      return;
+    }
+    if (popup) { popup.opener = null; popup.location.assign(data); }
+    else window.location.assign(data);
+  };
+
+  const shareProduct = async (product: Product) => {
+    setShareMessage('');
+    try {
+      await Share.share({
+        title: product.name,
+        text: `${product.name} â€” ${product.description}\nShop with hopNshop.`,
+        url: 'https://hopnshop.co.ke',
+        dialogTitle: 'Share with'
+      });
+    } catch (error) {
+      console.error('The product could not be shared from this device.', error);
+      setShareMessage('Sharing is not available on this device right now.');
+    }
+  };
+
+  const captureSourcingReference = async () => {
+    setSourceMessage('');
+    try {
+      const photo = await Camera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: CameraResultType.Uri,
+        source: CameraSource.Camera
+      });
+      if (!photo.webPath) throw new Error('The camera did not return an image.');
+
+      const response = await fetch(photo.webPath);
+      if (!response.ok) throw new Error('The captured image could not be read.');
+      const blob = await response.blob();
+      const format = photo.format === 'png' || photo.format === 'webp' ? photo.format : 'jpeg';
+      const file = new File([blob], `sourcing-reference-${Date.now()}.${format === 'jpeg' ? 'jpg' : format}`, {
+        type: blob.type || `image/${format}`
+      });
+      if (!sourcingReferenceImageSchema.safeParse(file).success) {
+        setSourceMessage('The photo must be a JPG, PNG or WebP image up to 5 MB.');
+        return;
+      }
+      setReferenceImage(file);
+    } catch (error) {
+      console.error('A sourcing reference photo could not be captured.', error instanceof Error ? error.message : String(error));
+      setSourceMessage('Camera access was cancelled or unavailable. Check camera permission or choose an image from your gallery.');
+    }
+  };
+
+  const sendSignInLink = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (!authEmailInput.current?.reportValidity()) return;
+    if (!supabase) {
+      setAuthMessage('Account services are not configured yet.');
+      return;
+    }
+    setAuthSubmitting(true);
+    setAuthMessage('');
+    const { error } = await supabase.auth.signInWithOtp({
+      email: customerEmail.trim(),
+      options: { emailRedirectTo: getAuthRedirectUrl() }
+    });
+    if (error) {
+      console.error('Could not send the customer sign-in link.', error.message);
+      setAuthMessage('We could not send a sign-in link. Check your email address and try again.');
+    } else {
+      setAuthMessage('Check your email for a secure sign-in link, then return here to continue.');
+    }
+    setAuthSubmitting(false);
+  };
+
+  const submitPasswordAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) {
+      setAuthMessage('Account services are not configured yet.');
+      return;
+    }
+    setAuthSubmitting(true);
+    setAuthMessage('');
+    const result = authMode === 'sign_up'
+      ? await supabase.auth.signUp({
+        email: customerEmail.trim(),
+        password: authPassword,
+        options: { emailRedirectTo: getAuthRedirectUrl() }
+      })
+      : await supabase.auth.signInWithPassword({ email: customerEmail.trim(), password: authPassword });
+    if (result.error) {
+      console.error('Password authentication failed.', result.error.message);
+      setAuthMessage(authMode === 'sign_up'
+        ? 'We could not create your account. Check your details and try again.'
+        : 'We could not sign you in. Check your email and password and try again.');
+    } else if (authMode === 'sign_up' && !result.data.session) {
+      setAuthMessage('Check your email to confirm your account, then sign in.');
+      void notificationEvents.accountRegistered(result.data.user.id, customerEmail.trim()).catch(() => {});
+    } else if (authMode === 'sign_up') {
+      setAuthMessage('Your account is ready.');
+      void notificationEvents.accountRegistered(result.data.user.id, customerEmail.trim()).catch(() => {});
+      void notificationEvents.emailVerified(result.data.user.id, customerEmail.trim()).catch(() => {});
+    } else {
+      void notificationEvents.accountRegistered(result.data.user.id, customerEmail.trim()).catch(() => {});
+    }
+    setAuthSubmitting(false);
+  };
+
+  const sendPasswordReset = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) {
+      setAuthMessage('Account services are not configured yet.');
+      return;
+    }
+    setAuthSubmitting(true);
+    setAuthMessage('');
+    const { error } = await supabase.auth.resetPasswordForEmail(customerEmail.trim(), {
+      redirectTo: getAuthRedirectUrl()
+    });
+    if (error) {
+      console.error('Password reset email could not be sent.', error.message);
+      setAuthMessage('We could not send a reset link. Check your email address and try again.');
+    } else {
+      setAuthMessage('If an account exists for that email, a password reset link is on its way.');
+      void notificationEvents.passwordReset('', customerEmail.trim()).catch(() => {});
+    }
+    setAuthSubmitting(false);
+  };
+
+  const saveNewPassword = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) return;
+    setAuthSubmitting(true);
+    setAuthMessage('');
+    const { error } = await supabase.auth.updateUser({ password: authPassword });
+    if (error) {
+      console.error('The account password could not be updated.', error.message);
+      setAuthMessage('We could not update your password. Request a new reset link and try again.');
+    } else {
+      setAuthMessage('Your password has been updated.');
+      setAuthMode('sign_in');
+      setAuthPassword('');
+      void notificationEvents.passwordReset('', customerEmail.trim()).catch(() => {});
+    }
+    setAuthSubmitting(false);
+  };
+
+  const addToCart = (product: Product, variant?: ProductVariant) => {
+    if (!canPurchaseResaleProduct(product)) return;
+    setCartMessage('');
+    if (cart[0] && cart[0].product.currency !== product.currency) {
+      setCartMessage('Products in different currencies need separate orders.');
+      setCartOpen(true);
+      return;
+    }
+    const existing = cart.find(line => line.product.id === product.id && line.variant?.id === variant?.id);
+    if (existing) setCart(cart.map(line => line.product.id === product.id && line.variant?.id === variant?.id ? { ...line, quantity: Math.min(100, line.quantity + 1) } : line));
+    else setCart([...cart, { product, variant, quantity: 1 }]);
+    setCartOpen(true);
+  };
+
+  const toggleWishlist = async (product: Product) => {
+    if (!supabase || !userId) {
+      setAuthOpen(true);
+      return;
+    }
+    if (wishlistBusyId) return;
+    setWishlistMessage('');
+    setWishlistBusyId(product.id);
+    let wishlistId: string | null = null;
+    const { data: existingWishlist, error: lookupError } = await supabase
+      .from('wishlists').select('id').eq('user_id', userId).maybeSingle();
+    if (lookupError) {
+      console.error('Wishlist could not be checked.', lookupError.message);
+      setWishlistMessage('We could not update your wishlist. Please try again.');
+      setWishlistBusyId('');
+      return;
+    }
+    wishlistId = existingWishlist?.id ?? null;
+    if (!wishlistId) {
+      const { data, error } = await supabase.from('wishlists').upsert({ user_id: userId }, { onConflict: 'user_id' }).select('id').single();
+      if (error) {
+        console.error('Wishlist could not be created.', error.message);
+        setWishlistMessage('We could not update your wishlist. Please try again.');
+        setWishlistBusyId('');
+        return;
+      }
+      wishlistId = data.id;
+    }
+    if (wishlistProductIds.includes(product.id)) {
+      const { error } = await supabase.from('wishlist_items').delete().eq('wishlist_id', wishlistId).eq('product_id', product.id);
+      if (error) {
+        console.error('Product could not be removed from the wishlist.', error.message);
+        setWishlistMessage('We could not update your wishlist. Please try again.');
+      }
+      else setWishlistProductIds(ids => ids.filter(id => id !== product.id));
+    } else {
+      const { error } = await supabase.from('wishlist_items').insert({ wishlist_id: wishlistId, product_id: product.id });
+      if (error) {
+        console.error('Product could not be saved to the wishlist.', error.message);
+        setWishlistMessage('We could not update your wishlist. Please try again.');
+      }
+      else setWishlistProductIds(ids => [...ids, product.id]);
+    }
+    setWishlistBusyId('');
+  };
+
+  const placeResaleOrder = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setCartMessage('');
+    const input = {
+      items: cart.map(line => ({ productId: line.product.id, variantId: line.variant?.id, quantity: line.quantity })),
+      ...delivery,
+      county: delivery.county.trim() || undefined
+    };
+    const parsed = resaleOrderSchema.safeParse(input);
+    if (!parsed.success) {
+      setCartMessage('Check your delivery details and product quantities.');
+      return;
+    }
+    if (!deliveryLocalityId || !selectedDeliveryOption) {
+      setCartMessage(deliveryOptionsError || 'Choose a configured delivery location and courier before placing your order.');
+      return;
+    }
+    if (cart.some(line => line.product.currency.toUpperCase() !== 'KES')) {
+      setCartMessage('Checkout is currently configured for KES-priced products and KES courier rates only.');
+      return;
+    }
+    if (!supabase || !userId) {
+      setCartMessage('Sign in before placing your order.');
+      setAuthOpen(true);
+      return;
+    }
+
+    setCheckoutSubmitting(true);
+    const checkoutPayload = {
+      p_items: parsed.data.items.map(item => ({ product_id: item.productId, variant_id: item.variantId, quantity: item.quantity })),
+      p_recipient_name: parsed.data.recipientName,
+      p_phone: parsed.data.phone,
+      p_address_line: parsed.data.addressLine,
+      p_locality_id: deliveryLocalityId,
+      p_service_area_id: selectedDeliveryOption.service_area_id
+    };
+    const fingerprint = JSON.stringify(checkoutPayload);
+    if (!checkoutIdempotencyKey.current || checkoutIdempotencyKey.current.fingerprint !== fingerprint) {
+      checkoutIdempotencyKey.current = { fingerprint, key: crypto.randomUUID() };
+    }
+    const { error } = await supabase.rpc('create_resale_order_with_delivery', {
+      ...checkoutPayload,
+      p_idempotency_key: checkoutIdempotencyKey.current.key
+    });
+    setCheckoutSubmitting(false);
+    if (error) {
+      console.error('Resale order could not be created.', error.message);
+      setCartMessage(error.message.includes('delivery')
+        ? 'This delivery option has changed or is no longer available. Choose another option and try again.'
+        : 'We could not place this order. A product may have changed; refresh the catalogue and try again.');
+      return;
+    }
+    checkoutIdempotencyKey.current = null;
+    setCart([]);
+    setCartOpen(false);
+    setDelivery({ recipientName: '', phone: '', addressLine: '', city: '', county: '' });
+    setDeliveryLocalityId('');
+    setDeliveryServiceAreaId('');
+    setAccountOpen(true);
+  };
+
+  const submitSourcingRequest = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSourceMessage('');
+
+    const parsed = sourcingRequestSchema.safeParse({
+      productUrl,
+      productName: productName.trim() || undefined,
+      categoryId: sourcingCategoryId || undefined,
+      brandPreference: brandPreference.trim() || undefined,
+      modelSpecification: modelSpecification.trim() || undefined,
+      productCondition: productCondition === 'any' ? undefined : productCondition,
+      preferredLocation: preferredLocation.trim() || undefined,
+      quantity: Number(quantity),
+      variant: variant.trim() || undefined,
+      customerRequirements: notes.trim() || undefined,
+      notes: notes.trim() || undefined
+    });
+    if (!parsed.success || !isValidPublicProductUrl(productUrl)) {
+      setSourceMessage('Enter a public HTTPS product link and a quantity between 1 and 100.');
+      return;
+    }
+    if (referenceImage && !sourcingReferenceImageSchema.safeParse(referenceImage).success) {
+      setSourceMessage('Choose a JPG, PNG or WebP reference image up to 5 MB.');
+      return;
+    }
+    if (!supabase) {
+      setSourceMessage('Secure request submission is not configured yet. Please try again later.');
+      return;
+    }
+
+    setSourceSubmitting(true);
+    let requestStored = false;
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) {
+        console.error('Could not check the customer session.', sessionError.message);
+        setSourceMessage('We could not verify your sign-in. Please try again.');
+        return;
+      }
+
+      if (!session) {
+        const { error } = await supabase.auth.signInWithOtp({
+          email: customerEmail.trim(),
+          options: { emailRedirectTo: window.location.origin }
+        });
+        if (error) {
+          console.error('Could not send the customer sign-in link.', error.message);
+          setSourceMessage('We could not send a sign-in link. Check your email address and try again.');
+          return;
+        }
+        setSourceMessage('Check your email for a secure sign-in link. Open it in this browser, then submit your request again.');
+        return;
+      }
+
+      const { data: requestData, error } = await supabase.from('sourcing_requests').insert({
+        user_id: session.user.id,
+        title: parsed.data.productName || 'Sourcing request',
+        product_url: parsed.data.productUrl,
+        product_name: parsed.data.productName ?? null,
+        category_id: parsed.data.categoryId ?? null,
+        brand_preference: parsed.data.brandPreference ?? null,
+        model_specification: parsed.data.modelSpecification ?? null,
+        product_condition: parsed.data.productCondition ?? null,
+        preferred_location: parsed.data.preferredLocation ?? null,
+        customer_requirements: parsed.data.customerRequirements ?? null,
+        quantity: parsed.data.quantity,
+        variant: parsed.data.variant ?? null,
+        notes: parsed.data.notes ?? null
+      }).select('id').single();
+      if (error) {
+        console.error('The sourcing request could not be saved.', error.message);
+        setSourceMessage('We could not save your request. Please try again.');
+        return;
+      }
+
+      requestStored = true;
+      setSourceSubmitted(true);
+      if (referenceImage) {
+        const extension = referenceImage.type === 'image/jpeg' ? 'jpg' : referenceImage.type === 'image/png' ? 'png' : 'webp';
+        const storagePath = `${session.user.id}/${requestData.id}/${crypto.randomUUID()}.${extension}`;
+        try {
+          const { error: uploadError } = await supabase.storage.from('sourcing-request-media').upload(storagePath, referenceImage, {
+            contentType: referenceImage.type,
+            cacheControl: '3600',
+            upsert: false
+          });
+          if (uploadError) throw uploadError;
+          const { error: mediaError } = await supabase.from('sourcing_request_media').insert({ request_id: requestData.id, storage_path: storagePath });
+          if (mediaError) {
+            await supabase.storage.from('sourcing-request-media').remove([storagePath]);
+            throw mediaError;
+          }
+          setSourceMessage('Your request and reference image were submitted securely. Our team will review the source before preparing a quotation.');
+        } catch (error) {
+          console.error('The sourcing request was saved but its reference image could not be attached.', error);
+          setSourceMessage('Your request was submitted, but the reference image could not be attached. The team can still review your product link.');
+        }
+      } else {
+        setSourceMessage('Your request was submitted securely. Our team will review the source before preparing a quotation.');
+      }
+      setProductUrl('');
+      setProductName('');
+      setSourcingCategoryId('');
+      setBrandPreference('');
+      setModelSpecification('');
+      setProductCondition('any');
+      setPreferredLocation('');
+      setReferenceImage(null);
+      setQuantity('1');
+      setVariant('');
+      setNotes('');
+    } catch (error) {
+      console.error('Unexpected sourcing request failure.', error);
+      if (requestStored) {
+        setSourceSubmitted(true);
+        setSourceMessage('Your request was submitted, but we could not attach the reference image. The team can still review your product link.');
+      } else {
+        setSourceMessage('Something went wrong while submitting your request. Please try again.');
+      }
+    } finally {
+      setSourceSubmitting(false);
+    }
+  };
+
+  const scrollToSection = (sectionId: string) => {
+    document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const openCampaignProduct = async (productId: string) => {
+    let product = products.find(item => item.id === productId);
+    if (!product && supabase) {
+      const { data, error } = await supabase.from('products')
+        .select('id,name,slug,description,brand,availability,business_model,category:categories(name),currency,local_selling_price,estimated_shipping,estimated_duties,source_url,affiliate_tracking_url,verified_at,created_at,product_media(storage_path,sort_order),product_variants(id,name,sku,attributes,price,available)')
+        .eq('publication_status', 'published')
+        .eq('id', productId)
+        .maybeSingle();
+      if (error) {
+        console.error('Campaign destination product could not be loaded.', error.message);
+        setStorefrontMessage('This campaign product could not be loaded. Please try the catalogue instead.');
+        scrollToSection('discover');
+        return;
+      }
+      if (data) product = (await mapCatalogueRecords([data as ProductRecord], supabase))[0];
+    }
+    if (!product) {
+      setStorefrontMessage('This campaign product is not currently available.');
+      scrollToSection('discover');
+      return;
+    }
+    setStorefrontMessage('');
+    setSelectedVariantId(product.variants?.[0]?.id ?? '');
+    setDetailProduct(product);
+  };
+
+  const handleCampaignAction = (activeCampaign: Omit<ActiveCampaign, 'id'>) => {
+    setStorefrontMessage('');
+    if (activeCampaign.targetType === 'sourcing') {
+      openSourcingDesk();
+      return;
+    }
+    if (!activeCampaign.targetId) {
+      setStorefrontMessage('This campaign destination is not available. Browse the current catalogue instead.');
+      scrollToSection('discover');
+      return;
+    }
+    if (activeCampaign.targetType === 'category') {
+      const category = sourcingCategories.find(item => item.id === activeCampaign.targetId);
+      if (!category) {
+        setStorefrontMessage('This campaign category is not currently published.');
+        scrollToSection('discover');
+        return;
+      }
+      setCategoryFilter(category.name);
+      scrollToSection('discover');
+      return;
+    }
+    if (activeCampaign.targetType === 'collection') {
+      if (!collections.some(item => item.id === activeCampaign.targetId)) {
+        setStorefrontMessage('This campaign collection is not currently available.');
+        scrollToSection('discover');
+        return;
+      }
+      scrollToSection(`collection-${activeCampaign.targetId}`);
+      return;
+    }
+    void openCampaignProduct(activeCampaign.targetId);
+  };
+
+  const loadMoreProducts = async () => {
+    if (!supabase || loadingMoreProducts) return;
+    if (visibleCount < filtered.length) {
+      setVisibleCount(count => count + 12);
+      return;
+    }
+    if (!hasMoreProducts) return;
+    setLoadingMoreProducts(true);
+    setLoadMoreError('');
+    const offset = products.length;
+    const { data, error } = await supabase.from('products')
+      .select('id,name,slug,description,brand,availability,business_model,category:categories(name),currency,local_selling_price,estimated_shipping,estimated_duties,source_url,affiliate_tracking_url,verified_at,created_at,product_media(storage_path,sort_order),product_variants(id,name,sku,attributes,price,available)')
+      .eq('publication_status', 'published')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(offset, offset + CATALOGUE_PAGE_SIZE);
+    if (error) {
+      console.error('More catalogue products could not be loaded.', error.message);
+      setLoadMoreError('More products could not be loaded. Please try again.');
+      setLoadingMoreProducts(false);
+      return;
+    }
+    const records = (data ?? []) as ProductRecord[];
+    const nextProducts = await mapCatalogueRecords(records.slice(0, CATALOGUE_PAGE_SIZE), supabase);
+    setProducts(current => {
+      const currentIds = new Set(current.map(product => product.id));
+      return [...current, ...nextProducts.filter(product => !currentIds.has(product.id))];
+    });
+    setHasMoreProducts(records.length > CATALOGUE_PAGE_SIZE);
+    setVisibleCount(count => count + CATALOGUE_PAGE_SIZE);
+    setLoadingMoreProducts(false);
+  };
+
+  return <IonApp><IonPage><IonContent fullscreen>
+    {!isOnline && <p className="checkout-notice network-status" role="status" aria-live="polite">Youâ€™re offline. Some shopping and account actions need an internet connection.</p>}
+    <StorefrontHeader
+      categories={categories}
+      categoryFilter={categoryFilter}
+      search={search}
+      searchSuggestions={searchSuggestions}
+      wishlistCount={wishlistProductIds.length}
+      cartCount={cart.reduce((count, item) => count + item.quantity, 0)}
+      signedIn={Boolean(userId)}
+      onCategoryChange={setCategoryFilter}
+      onSearchChange={setSearch}
+      onWishlist={openWishlist}
+      onNotifications={() => { if (userId) setNotificationCentreOpen(true); }}
+      onAccount={() => userId ? setAccountOpen(true) : setAuthOpen(true)}
+      onCart={() => setCartOpen(true)}
+    />
+    <main id="top">
+      <section className="marketplace-intro" aria-labelledby="marketplace-title">
+        <div><p className="eyebrow">The hopNshop marketplace</p><h1 id="marketplace-title">Your Favourite Finds. <em>One Smarter Shopping Destination.</em></h1></div>
+        <p>Discover a considered edit of products across fashion, technology, home and more. Shop with hopNshop or ask us to source a find.</p>
+        {storefrontMessage && <p className="form-message" role="status">{storefrontMessage}</p>}
+      </section>
+      <HomeHero onSourceRequest={() => openSourcingDesk()} campaign={campaign} onCampaignAction={handleCampaignAction} />
+      <section className="section category-discovery" aria-labelledby="category-title">
+        <div className="section-heading">
+          <div><p className="eyebrow">The category edit</p><h2 id="category-title">Find your <em>kind of thing.</em></h2></div>
+          <p className="muted">A world of good finds, thoughtfully gathered.</p>
+        </div>
+        <div className="category-tile-grid">
+          {STOREFRONT_CATEGORIES.map(category => <button className="category-tile" type="button" key={category.slug} onClick={() => {
+            const legacySportsCategory = category.name === 'Sports & Outdoors' && publishedCategories.includes('Sports') && !publishedCategories.includes(category.name);
+            setCategoryFilter(legacySportsCategory ? 'Sports' : category.name);
+            scrollToSection('discover');
+          }}>
+            <span className="category-tile-image"><img src={category.image} alt="" loading="lazy" decoding="async" /></span>
+            <span className="category-tile-copy"><strong>{category.name}</strong><small>{category.description}</small></span>
+          </button>)}
+        </div>
+      </section>
+      <section className="section discovery-section" id="discover"><div className="section-heading"><div><p className="eyebrow">Published catalogue</p><h2>Shop the <em>latest</em></h2></div><p className="muted">Browse without an account. Each listing shows how it can be purchased.</p></div>{wishlistMessage && <p className="form-message" role="alert">{wishlistMessage}</p>}{affiliateMessage && <p className="form-message" role="alert">{affiliateMessage}</p>}{shareMessage && <p className="form-message" role="status">{shareMessage}</p>}
+        <div className="discovery-filters" aria-label="Filter and sort products">
+          <label>Category<select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="">All categories</option>{categories.map(category => <option value={category} key={category}>{category}</option>)}</select></label>
+          <label>Brand<select value={brandFilter} onChange={event => setBrandFilter(event.target.value)}><option value="">All brands</option>{brands.map(brand => <option value={brand} key={brand}>{brand}</option>)}</select></label>
+          {sizes.length > 0 && <label>Size<select value={sizeFilter} onChange={event => setSizeFilter(event.target.value)}><option value="">All sizes</option>{sizes.map(size => <option key={size} value={size}>{size}</option>)}</select></label>}
+          {colours.length > 0 && <label>Colour<select value={colourFilter} onChange={event => setColourFilter(event.target.value)}><option value="">All colours</option>{colours.map(colour => <option key={colour} value={colour}>{colour}</option>)}</select></label>}
+          <label>Availability<select value={availabilityFilter} onChange={event => setAvailabilityFilter(event.target.value as ProductAvailability | '')}><option value="">All availability</option><option value="local_inventory">Local inventory</option><option value="pre_order">Pre-order</option><option value="affiliate">Affiliate</option><option value="sourcing_only">Sourcing only</option></select></label>
+          <label>Currency<select value={currencyFilter} onChange={event => setCurrencyFilter(event.target.value)}><option value="">All currencies</option>{currencies.map(currency => <option value={currency} key={currency}>{currency === 'KES' ? 'KES Â· Kenyan shilling' : currency}</option>)}</select></label>
+          <label>Sort<select value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="newest">Newest</option><option value="price_asc">Price: low to high</option><option value="price_desc">Price: high to low</option><option value="name">Name</option></select></label>
+          <button className="text-button" type="button" onClick={() => { setSearch(''); setCategoryFilter(''); setBrandFilter(''); setSizeFilter(''); setColourFilter(''); setAvailabilityFilter(''); setCurrencyFilter(''); setSortBy('newest'); setVisibleCount(12); }}>Clear filters</button>
+        </div>
+        {categoryLoadError && <p className="availability-note" role="status">Categories could not be refreshed. Showing categories attached to published products.</p>}
+        {!currencyFilter && currencies.length > 1 && (sortBy === 'price_asc' || sortBy === 'price_desc') && <p className="availability-note" role="status">Prices are grouped by currency; choose one currency for a direct comparison.</p>}
+        {productsLoading ? <div className="empty-state" role="status"><p>Loading the latest editâ€¦</p></div>
+          : catalogueError ? <div className="empty-state" role="alert"><h3>The shelves are temporarily unavailable.</h3><p>Please try again shortly, or tell us what you are looking for and our team can help.</p><button className="button button-dark" onClick={() => openSourcingDesk()}>Request a product <IonIcon icon={arrowForwardOutline} /></button></div>
+          : visibleProducts.length ? <>
+            <div className="product-grid">{visibleProducts.map(product => {
+              const saved = wishlistProductIds.includes(product.id);
+              const availability = product.availability.replaceAll('_', ' ');
+              return <article className="product-card" key={product.id}>
+                <div className="product-image">
+                  {product.imageUrl ? <img src={product.imageUrl} alt={product.name} loading="lazy" decoding="async" /> : <span className="product-image-placeholder" aria-hidden="true">hopNshop</span>}
+                  <span className="product-model-badge">{modelLabels[product.businessModel]}</span>
+                  <button className="wishlist-toggle" type="button" aria-label={saved ? `Remove ${product.name} from wishlist` : `Save ${product.name} to wishlist`} aria-pressed={saved} disabled={wishlistBusyId === product.id} onClick={() => void toggleWishlist(product)}><IonIcon icon={saved ? heart : heartOutline} /></button>
+                </div>
+                <div className="product-card-content">
+                  <div className="product-card-meta"><span>{product.category ?? modelLabels[product.businessModel]}</span><span>{availability}</span></div>
+                  <h3>{product.name}</h3>
+                  {product.localPrice !== undefined && <p className="product-price">{formatPrice(product.localPrice, product.currency)}</p>}
+                  <p className="product-description">{product.description}</p>
+                  <button className="text-button product-details-link" type="button" onClick={() => { setSelectedVariantId(product.variants?.[0]?.id ?? ''); setDetailProduct(product); }}>Product details</button>
+                  <div className="product-card-action">
+                    {product.businessModel === 'affiliate' && product.affiliateLinkId && <button className="button button-lime" type="button" onClick={() => void openAffiliateRetailer(product)}>Visit retailer <IonIcon icon={arrowForwardOutline} /></button>}
+                    {product.businessModel === 'affiliate' && !product.affiliateLinkId && <small className="availability-note">Retailer link is being reviewed.</small>}
+                    {canPurchaseResaleProduct(product) && <button className="button button-lime" type="button" onClick={() => product.variants?.length ? (setSelectedVariantId(product.variants[0].id), setDetailProduct(product)) : addToCart(product)}>Add to bag <IonIcon icon={bagHandleOutline} /></button>}
+                    {product.businessModel === 'resale' && !canPurchaseResaleProduct(product) && <small className="availability-note">Price or availability needs confirmation.</small>}
+                    {product.businessModel === 'sourcing' && <button className="button button-lime" type="button" onClick={() => openSourcingDesk(product)}>Request this find <IonIcon icon={arrowForwardOutline} /></button>}
+                    <button className="text-button" type="button" onClick={() => void shareProduct(product)}>Share</button>
+                  </div>
+                </div>
+              </article>;
+            })}</div>
+            {(visibleCount < filtered.length || hasMoreProducts) && <><button className="button button-dark load-more" type="button" onClick={() => void loadMoreProducts()} disabled={loadingMoreProducts}>{loadingMoreProducts ? 'Loading productsâ€¦' : 'Load more products'}</button>{loadMoreError && <p className="form-message" role="alert">{loadMoreError} <button className="text-button" type="button" onClick={() => void loadMoreProducts()}>Try again</button></p>}</>}
+          </>
+            : products.length && hasMoreProducts ? <div className="empty-state"><h3>No match on this page.</h3><p>There are more published products to search. Load the next page or clear a filter.</p><button className="button button-dark" type="button" onClick={() => void loadMoreProducts()} disabled={loadingMoreProducts}>{loadingMoreProducts ? 'Loading productsâ€¦' : 'Load more products'}</button>{loadMoreError && <p className="form-message" role="alert">{loadMoreError}</p>}</div>
+              : products.length ? <div className="empty-state"><h3>No products match your filters.</h3><p>Clear a filter or ask our sourcing team to find it.</p><button className="button button-dark" onClick={() => { setSearch(''); setCategoryFilter(''); setBrandFilter(''); setSizeFilter(''); setColourFilter(''); setAvailabilityFilter(''); setCurrencyFilter(''); setSortBy('newest'); }}>Clear filters</button></div>
+              : <div className="empty-state"><div className="empty-mark">âœ¦</div><h3>The shelves are being set.</h3><p>Our team is reviewing the next edit. In the meantime, tell us what you are looking for and we will help you find it.</p><button className="button button-dark" onClick={() => openSourcingDesk()}>Request a product <IonIcon icon={arrowForwardOutline} /></button></div>}
+      </section>
+      {collections.length > 0 && <section className="section curated-collections" aria-labelledby="collections-title"><div className="section-heading"><div><p className="eyebrow">Curated collections</p><h2 id="collections-title">Thoughtful <em>little edits.</em></h2></div><p className="muted">A few good things, gathered around an idea.</p></div><div className="collection-grid">{collections.map(collection => <article className="collection-card" id={`collection-${collection.id}`} key={collection.id}>{collection.imageUrl && <img className="collection-image" src={collection.imageUrl} alt="" loading="lazy" />}<h3>{collection.name}</h3>{collection.description && <p>{collection.description}</p>}<div className="collection-products">{collection.products.map(product => <button type="button" key={product.id} onClick={() => { setSelectedVariantId(product.variants?.[0]?.id ?? ''); setDetailProduct(product); }}>{product.imageUrl && <img src={product.imageUrl} alt="" loading="lazy" />}<span>{product.name}</span></button>)}</div></article>)}</div></section>}
+      <section className="section shopping-paths" aria-labelledby="shopping-paths-title"><div className="section-heading"><div><p className="eyebrow">Three ways to shop</p><h2 id="shopping-paths-title">Choose what works <em>for you.</em></h2></div><p className="muted">Every purchase path is shown clearly before you proceed.</p></div><div className="shopping-path-grid"><article className="shopping-path-card"><IonIcon icon={searchOutline} /><h3>Shop the catalogue</h3><p>Explore affiliate products and see the seller, price and checkout destination before leaving hopNshop.</p><button className="text-button" type="button" onClick={() => scrollToSection('discover')}>Browse products <IonIcon icon={arrowForwardOutline} /></button></article><article className="shopping-path-card"><IonIcon icon={cubeOutline} /><h3>Pre-order with hopNshop</h3><p>Place a request for a listed product. We confirm availability and provide the applicable order details.</p><button className="text-button" type="button" onClick={() => { setAvailabilityFilter('pre_order'); setCategoryFilter(''); setBrandFilter(''); setSizeFilter(''); setColourFilter(''); setVisibleCount(12); scrollToSection('discover'); }}>See pre-orders <IonIcon icon={arrowForwardOutline} /></button></article><article className="shopping-path-card"><IonIcon icon={sparklesOutline} /><h3>Request personal sourcing</h3><p>Send a link or product description. Review the quotation before accepting or making a payment.</p><button className="text-button" type="button" onClick={() => openSourcingDesk()}>Start a sourcing request <IonIcon icon={arrowForwardOutline} /></button></article></div></section>
+      <section className="section shopping-steps" aria-labelledby="shopping-steps-title"><div className="section-heading"><div><p className="eyebrow">A clear process</p><h2 id="shopping-steps-title">How hopNshop <em>works.</em></h2></div></div><div className="shopping-steps-grid"><article><span>01</span><h3>Discover</h3><p>Browse real published listings or tell us what you want us to find.</p></article><article><span>02</span><h3>Choose a path</h3><p>Shop via an affiliate link, place a pre-order request, or ask for a personal sourcing quote.</p></article><article><span>03</span><h3>Review the details</h3><p>For sourcing, check the quotation and terms before accepting. No sourcing payment is requested before confirmation.</p></article><article><span>04</span><h3>Follow your order</h3><p>Sign in to review applicable order details and updates as they become available.</p></article></div></section>
+      <section className="section marketplace-faq" aria-labelledby="marketplace-faq-title"><div className="section-heading"><div><p className="eyebrow">Good to know</p><h2 id="marketplace-faq-title">Shopping, <em>clearly explained.</em></h2></div></div><div className="faq-list"><details><summary>What is the difference between the ways to shop?</summary><p>Affiliate listings direct you to a third-party seller. Pre-order requests are fulfilled by hopNshop subject to confirmation. Personal sourcing starts with your request and a quotation for you to review.</p></details><details><summary>Do I have to create an account to browse?</summary><p>No. You can browse the public catalogue without an account. Sign-in is required for account-specific features such as saving products or reviewing your orders.</p></details><details><summary>When do I pay for a sourcing request?</summary><p>We first review the request and provide a quotation. You can review its costs and terms before deciding whether to accept it.</p></details><details><summary>Are listed prices or delivery dates guaranteed?</summary><p>Product, shipping and availability details can depend on the seller, stock and destination. Review the applicable listing or confirmed quotation before placing an order.</p></details></div></section>
+      <section className="footer-cta"><p className="eyebrow">Keep in the loop</p><h2>Good finds, <em>occasionally.</em></h2><p>New edits, sourcing notes and useful guides. No noise.</p><p className="checkout-notice">Newsletter signup is not connected yet, so we are not collecting email addresses here.</p><small>{isSupabaseConfigured ? 'Updates will be available when a delivery provider is configured.' : 'Updates need Supabase and an email provider before signup can be enabled.'}</small></section>
+    </main>
+    {sourcingOpen && <div className="modal-backdrop" role="presentation" onClick={() => setSourcingOpen(false)}>
+      <div className="modal sourcing-modal" role="dialog" aria-modal="true" aria-labelledby="source-title" onClick={event => event.stopPropagation()}>
+        <button className="modal-close" onClick={() => setSourcingOpen(false)} aria-label="Close">Ã—</button>
+        <p className="eyebrow">The sourcing desk</p>
+        <h2 id="source-title">What are you looking for?</h2>
+        <p>Share the product details and our team will review the source before preparing a quotation. No payment is taken at this stage.</p>
+        <form onSubmit={submitSourcingRequest}>
+          <label>Email for secure sign-in<input required type="email" autoComplete="email" value={customerEmail} onChange={event => setCustomerEmail(event.target.value)} placeholder="you@example.com" /></label>
+          <label>Product link<input required type="url" value={productUrl} onChange={event => setProductUrl(event.target.value)} placeholder="https://â€¦ product link" /></label>
+          <label>Product name, if known<input maxLength={200} value={productName} onChange={event => setProductName(event.target.value)} placeholder="Product or listing name" /></label>
+          <div className="sourcing-form-grid">
+            <label>Category<select value={sourcingCategoryId} onChange={event => setSourcingCategoryId(event.target.value)}><option value="">Choose if known</option>{sourcingCategories.map(category => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
+            <label>Condition<select value={productCondition} onChange={event => setProductCondition(event.target.value as typeof productCondition)}><option value="any">Any condition</option><option value="new">New</option><option value="used">Used</option><option value="refurbished">Refurbished</option></select></label>
+            <label>Preferred brand<input maxLength={200} value={brandPreference} onChange={event => setBrandPreference(event.target.value)} placeholder="Optional" /></label>
+            <label>Model or specification<input maxLength={200} value={modelSpecification} onChange={event => setModelSpecification(event.target.value)} placeholder="Optional" /></label>
+            <label>Preferred sourcing location<input maxLength={200} value={preferredLocation} onChange={event => setPreferredLocation(event.target.value)} placeholder="Optional" /></label>
+            <label>Quantity<input required type="number" min="1" max="100" value={quantity} onChange={event => setQuantity(event.target.value)} /></label>
+            <label>Size, colour or variant<input maxLength={200} value={variant} onChange={event => setVariant(event.target.value)} placeholder="Optional" /></label>
+          </div>
+          {Capacitor.isNativePlatform() && <button className="text-button" type="button" onClick={() => void captureSourcingReference()}>Take a reference photo</button>}
+          <label>Choose a gallery image (JPG, PNG or WebP, up to 5 MB)<input type="file" accept="image/jpeg,image/png,image/webp" onChange={event => setReferenceImage(event.currentTarget.files?.[0] ?? null)} /></label>
+          {referenceImage && <small>{referenceImage.name}</small>}
+          <label>Additional product requirements<textarea maxLength={2000} value={notes} onChange={event => setNotes(event.target.value)} placeholder="Tell us what matters most about this item" /></label>
+          {sourceMessage && <p className={sourceSubmitted ? 'form-message success' : 'form-message'} role="status">{sourceMessage}</p>}
+          <button className="button button-dark" type="submit" disabled={sourceSubmitting || sourceSubmitted}>{sourceSubmitting ? 'Submittingâ€¦' : sourceSubmitted ? 'Request submitted' : 'Continue securely'} <IonIcon icon={arrowForwardOutline} /></button>
+        </form>
+      </div>
+    </div>}
+    {detailProduct && <div className="modal-backdrop" role="presentation" onClick={() => setDetailProduct(null)}><section className="modal product-detail-modal" role="dialog" aria-modal="true" aria-labelledby="product-detail-title" onClick={event => event.stopPropagation()}><button className="modal-close" onClick={() => setDetailProduct(null)} aria-label="Close product details">Ã—</button><p className="eyebrow">{modelLabels[detailProduct.businessModel]}</p><h2 id="product-detail-title">{detailProduct.name}</h2>{detailProduct.imageUrls && detailProduct.imageUrls.length > 0 && <div className="product-gallery">{detailProduct.imageUrls.map((url, index) => <img key={url} src={url} alt={`${detailProduct.name}, image ${index + 1}`} />)}</div>}<p>{detailProduct.description}</p>{detailProduct.variants && detailProduct.variants.length > 0 && <label>Choose an option<select value={selectedVariantId} onChange={event => setSelectedVariantId(event.target.value)}>{detailProduct.variants.map(option => <option key={option.id} value={option.id}>{option.name}{option.price !== null && option.price !== undefined ? ` | ${detailProduct.currency} ${Number(option.price).toLocaleString()}` : ''}</option>)}</select></label>}<dl className="product-detail-list"><div><dt>Availability</dt><dd>{detailProduct.availability.replaceAll('_', ' ')}</dd></div>{detailProduct.brand && <div><dt>Brand</dt><dd>{detailProduct.brand}</dd></div>}{detailProduct.category && <div><dt>Category</dt><dd>{detailProduct.category}</dd></div>}{detailProduct.localPrice !== undefined && <div><dt>Current listed price</dt><dd>{detailProduct.currency.toUpperCase()} {detailProduct.localPrice.toLocaleString()}</dd></div>}{detailProduct.estimatedShipping !== undefined && <div><dt>Estimated shipping</dt><dd>{detailProduct.currency.toUpperCase()} {detailProduct.estimatedShipping.toLocaleString()} Â· estimate</dd></div>}{detailProduct.estimatedDuties !== undefined && <div><dt>Estimated duties</dt><dd>{detailProduct.currency.toUpperCase()} {detailProduct.estimatedDuties.toLocaleString()} Â· estimate</dd></div>}{detailProduct.verifiedAt && <div><dt>Last source check</dt><dd>{new Date(detailProduct.verifiedAt).toLocaleDateString()}</dd></div>}</dl>{detailProduct.businessModel === 'affiliate' && <p className="checkout-notice">This link takes you to an external retailer. hopNshop does not process its payment, delivery, returns or customer support.</p>}{detailProduct.businessModel === 'resale' && <p className="checkout-notice">The displayed item price is not a payment receipt. Delivery costs and fulfillment details are confirmed separately.</p>}{detailProduct.businessModel === 'sourcing' && <p className="checkout-notice">Sourcing costs are estimates until a reviewed quotation is accepted. No procurement begins before verified payment.</p>}{detailProduct.sourceUrl && isValidPublicProductUrl(detailProduct.sourceUrl) && <p><a href={detailProduct.sourceUrl} target="_blank" rel="noopener noreferrer">View source information</a></p>}{detailProduct.businessModel === 'affiliate' && detailProduct.affiliateLinkId && <button className="button button-dark" type="button" onClick={() => void openAffiliateRetailer(detailProduct)}>Visit retailer <IonIcon icon={arrowForwardOutline} /></button>}{canPurchaseResaleProduct(detailProduct) && <button className="button button-dark" onClick={() => { addToCart(detailProduct, detailProduct.variants?.find(option => option.id === selectedVariantId)); setDetailProduct(null); }}>Add to bag <IonIcon icon={bagHandleOutline} /></button>}</section></div>}
+    {authOpen && <div className="modal-backdrop" role="presentation" onClick={() => setAuthOpen(false)}>
+      <div className="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="signin-title" onClick={event => event.stopPropagation()}>
+        <button className="modal-close" onClick={() => setAuthOpen(false)} aria-label="Close">Ã—</button>
+        <p className="eyebrow">Secure account</p>
+        <h2 id="signin-title">{authMode === 'sign_up' ? 'Create your account.' : authMode === 'forgot_password' ? 'Reset your password.' : authMode === 'recovery' ? 'Choose a new password.' : 'Welcome back.'}</h2>
+        <p>{authMode === 'forgot_password'
+          ? 'We will email a secure reset link if an account exists for that address.'
+          : authMode === 'recovery'
+            ? 'Use at least 8 characters for your new password.'
+            : authMode === 'sign_up'
+              ? 'Set up your account with an email and a password.'
+              : 'Sign in with your password or a secure email link.'}</p>
+        {authMode === 'forgot_password' ? <>
+          <form className="auth-form" onSubmit={sendPasswordReset}>
+            <label>Email address<input required type="email" autoComplete="email" value={customerEmail} onChange={event => setCustomerEmail(event.target.value)} placeholder="you@example.com" /></label>
+            {authMessage && <p className="form-message" role="status">{authMessage}</p>}
+            <button className="button button-dark" type="submit" disabled={authSubmitting}>{authSubmitting ? 'Sendingâ€¦' : 'Send reset link'}</button>
+          </form>
+          <button className="auth-link auth-back-link" type="button" onClick={() => { setAuthMode('sign_in'); setAuthMessage(''); }}>Back to sign in</button>
+        </> : authMode === 'recovery' ? <>
+          <form className="auth-form" onSubmit={saveNewPassword}>
+            <label>New password<input required type="password" minLength={8} autoComplete="new-password" value={authPassword} onChange={event => setAuthPassword(event.target.value)} /></label>
+            {authMessage && <p className="form-message" role="status">{authMessage}</p>}
+            <button className="button button-dark" type="submit" disabled={authSubmitting}>{authSubmitting ? 'Updatingâ€¦' : 'Update password'}</button>
+          </form>
+          <button className="auth-link auth-back-link" type="button" onClick={() => { setAuthMode('sign_in'); setAuthMessage(''); }}>Back to sign in</button>
+        </> : <>
+          <form className="auth-form" onSubmit={submitPasswordAuth}>
+            <label>Email address<input ref={authEmailInput} required type="email" autoComplete="email" value={customerEmail} onChange={event => setCustomerEmail(event.target.value)} placeholder="you@example.com" /></label>
+            <label>Password<input required type="password" minLength={8} autoComplete={authMode === 'sign_up' ? 'new-password' : 'current-password'} value={authPassword} onChange={event => setAuthPassword(event.target.value)} /></label>
+            {authMessage && <p className="form-message" role="status">{authMessage}</p>}
+            <button className="button button-dark" type="submit" disabled={authSubmitting}>{authSubmitting ? 'Please waitâ€¦' : authMode === 'sign_up' ? 'Create account' : 'Sign in'}</button>
+          </form>
+          <div className="auth-actions">
+            {authMode === 'sign_in' ? <>
+              <button className="auth-link auth-link-primary" type="button" onClick={() => void sendSignInLink()} disabled={authSubmitting}>{authSubmitting ? 'Sendingâ€¦' : 'Email me a one-time sign-in link'}</button>
+              <div className="auth-actions-row">
+                <button className="auth-link" type="button" onClick={() => { setAuthMode('sign_up'); setAuthMessage(''); }} disabled={authSubmitting}>Create an account</button>
+                <button className="auth-link" type="button" onClick={() => { setAuthMode('forgot_password'); setAuthMessage(''); }} disabled={authSubmitting}>Forgot password?</button>
+              </div>
+            </> : <button className="auth-link" type="button" onClick={() => { setAuthMode('sign_in'); setAuthMessage(''); }} disabled={authSubmitting}>Already have an account? Sign in</button>}
+          </div>
+        </>}
+      </div>
+    </div>}
+    {cartOpen && <div className="modal-backdrop" role="presentation" onClick={() => setCartOpen(false)}>
+      <div className="modal cart-modal" role="dialog" aria-modal="true" aria-labelledby="cart-title" onClick={event => event.stopPropagation()}>
+        <button className="modal-close" onClick={() => setCartOpen(false)} aria-label="Close">Ã—</button>
+        <p className="eyebrow">Resale order</p>
+        <h2 id="cart-title">Your bag</h2>
+        {cart.length === 0 ? <div className="empty-state">
+          <p>Your bag is empty. Affiliate purchases happen with the retailer and are not added to hopNshop orders.</p>
+          <button className="button button-dark" onClick={() => setCartOpen(false)}>Continue browsing</button>
+        </div> : <>
+          <div className="cart-items">{cart.map(line => <article className="cart-item" key={`${line.product.id}-${line.variant?.id ?? "base"}`}>
+            <div><strong>{line.product.name}{line.variant ? ` | ${line.variant.name}` : ''}</strong><p>{line.product.currency.toUpperCase()} {(line.variant?.price ?? line.product.localPrice)?.toLocaleString()}</p></div>
+            <label>Qty<input type="number" min="1" max="100" value={line.quantity} onChange={event => {
+              const next = Number(event.target.value);
+              setCart(current => current.map(item => item.product.id === line.product.id && item.variant?.id === line.variant?.id ? { ...item, quantity: next } : item));
+            }} /></label>
+            <button className="text-button" onClick={() => setCart(current => current.filter(item => item.product.id !== line.product.id || item.variant?.id !== line.variant?.id))}>Remove</button>
+          </article>)}</div>
+          <p className="cart-total">Items subtotal <strong>{cart[0]?.product.currency.toUpperCase()} {cartItemsSubtotal.toLocaleString()}</strong></p>
+          {selectedDeliveryOption && <p className="cart-total">Estimated delivery Â· {selectedDeliveryOption.courier_name}<strong>{formatPrice(Number(selectedDeliveryOption.estimated_fee), selectedDeliveryOption.currency)}</strong></p>}
+          <p className="checkout-notice">HopNShop-managed orders are prepaid only. Delivery is estimated from a configured courier rate; payment is still pending until verified M-Pesa instructions are available. Procurement and dispatch cannot proceed until payment is verified.</p>
+          {!userId && <button className="button button-dark" onClick={() => setAuthOpen(true)}>Sign in to place this order</button>}
+          <form onSubmit={placeResaleOrder}>
+            <h3>Delivery details</h3>
+            {userId && <CheckoutSavedAddresses userId={userId} onSelect={address => {
+              const matchingLocalities = address ? deliveryLocalities.filter(item =>
+                item.county.toLowerCase() === address.county.toLowerCase()
+                && item.town.toLowerCase() === address.city.toLowerCase()
+              ) : [];
+              const locality = matchingLocalities.length === 1 ? matchingLocalities[0] : undefined;
+              setDelivery(address ? {
+                recipientName: address.recipient_name,
+                phone: address.phone,
+                addressLine: address.address_line,
+                city: address.city,
+                county: address.county
+              } : { recipientName: '', phone: '', addressLine: '', city: '', county: '' });
+              setDeliveryLocalityId(locality?.id ?? '');
+              setDeliveryServiceAreaId('');
+            }} />}
+            <label>Recipient name<input required minLength={2} maxLength={120} autoComplete="name" value={delivery.recipientName} onChange={event => setDelivery(current => ({ ...current, recipientName: event.target.value }))} /></label>
+            <label>Phone<input required type="tel" minLength={8} maxLength={24} pattern="[0-9+() -]{8,24}" autoComplete="tel" value={delivery.phone} onChange={event => setDelivery(current => ({ ...current, phone: event.target.value }))} /></label>
+            <label>{selectedDeliveryOption?.service_type === 'pickup_point' ? 'Configured pickup point' : 'Street address'}
+              <input required minLength={5} maxLength={300} autoComplete="street-address"
+                readOnly={selectedDeliveryOption?.service_type === 'pickup_point'}
+                value={selectedDeliveryOption?.service_type === 'pickup_point'
+                  ? selectedDeliveryLocality?.pickup_point ?? ''
+                  : delivery.addressLine}
+                onChange={event => setDelivery(current => ({ ...current, addressLine: event.target.value }))} />
+            </label>
+            <label>Serviceable town and locality
+              <select required value={deliveryLocalityId} disabled={deliveryLocalitiesLoading || deliveryLocalities.length === 0} onChange={event => {
+                const locality = deliveryLocalities.find(item => item.id === event.target.value);
+                setDeliveryLocalityId(event.target.value);
+                setDeliveryServiceAreaId('');
+                setDelivery(current => ({ ...current, city: locality?.town ?? '', county: locality?.county ?? '' }));
+              }}>
+                <option value="">{deliveryLocalitiesLoading ? 'Loading verified delivery areasâ€¦' : 'Choose a configured delivery area'}</option>
+                {deliveryLocalities.map(locality => <option value={locality.id} key={locality.id}>
+                  {[locality.locality, locality.estate_or_neighbourhood, locality.town, locality.county].filter(Boolean).join(' Â· ')}
+                  {locality.pickup_point ? ` Â· Pickup: ${locality.pickup_point}` : ''}
+                </option>)}
+              </select>
+            </label>
+            {deliveryLocalitiesError && <p className="form-message" role="alert">{deliveryLocalitiesError}</p>}
+            {!deliveryLocalitiesLoading && !deliveryLocalitiesError && deliveryLocalities.length === 0 && <p className="checkout-notice">No verified delivery areas are configured yet. We cannot accept a delivery order until an administrator confirms a locality, courier and rate.</p>}
+            {deliveryLocalityId && <label>Available courier service
+              <select required value={deliveryServiceAreaId} disabled={deliveryOptionsLoading || deliveryOptions.length === 0} onChange={event => setDeliveryServiceAreaId(event.target.value)}>
+                <option value="">{deliveryOptionsLoading ? 'Calculating delivery optionsâ€¦' : 'Choose a courier service'}</option>
+                {deliveryOptions.map(option => <option value={option.service_area_id} key={option.service_area_id}>
+                  {option.courier_name} Â· {option.service_type === 'pickup_point' ? 'Pickup point' : 'Doorstep'} Â· {option.min_delivery_days}â€“{option.max_delivery_days} days Â· {formatPrice(Number(option.estimated_fee), option.currency)}
+                </option>)}
+              </select>
+            </label>}
+            {deliveryOptionsError && <p className="checkout-address-status" role="status">{deliveryOptionsError}</p>}
+            {selectedDeliveryOption && <p className="checkout-address-status">Rate source: {selectedDeliveryOption.rate_source} Â· checked {new Date(selectedDeliveryOption.quoted_at).toLocaleDateString()} Â· estimated {selectedDeliveryOption.estimated_parcels} parcel(s). Final packing may differ; any extra charge requires your approval.</p>}
+            {selectedDeliveryOption && <p className="cart-total">Estimated order total <strong>{formatPrice(cartItemsSubtotal + Number(selectedDeliveryOption.estimated_fee), selectedDeliveryOption.currency)}</strong></p>}
+            {cartMessage && <p className="form-message" role="alert">{cartMessage}</p>}
+            <button className="button button-dark" type="submit" disabled={checkoutSubmitting || !userId || !deliveryLocalityId || !selectedDeliveryOption || deliveryOptionsLoading}>{checkoutSubmitting ? 'Creating orderâ€¦' : 'Create prepaid order Â· payment pending'}</button>
+          </form>
+        </>}
+      </div>
+    </div>}
+    {accountOpen && userId && <CustomerAccount userId={userId} email={customerEmail} onClose={() => setAccountOpen(false)} onSignOut={async () => { if (!supabase) return; const { error } = await supabase.auth.signOut(); if (error) console.error('Sign out failed.', error.message); setAccountOpen(false); setNotificationCentreOpen(false); }} />}
+    {notificationCentreOpen && userId && <CustomerNotificationCentre userId={userId} onClose={() => setNotificationCentreOpen(false)} />}
+    <footer><span className="wordmark"><span>hop</span><b>N</b><span>shop</span></span><span>Â© {new Date().getFullYear()} hopNshop</span><span>Affiliate disclosure Â· Privacy Â· Terms</span></footer>
+  </IonContent></IonPage></IonApp>;
+}
+
+export default App;
+
+
+
+
+
+
